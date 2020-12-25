@@ -1,0 +1,212 @@
+
+---
+title: "Causal Impact - campaign analysis"
+output:
+  html_document:
+    toc: true
+---
+
+# 
+
+#### This analysis uses 2 data sets
+##### 1. Daily transactions: 
+###### Aim: To detect trend, seasonality in the time series data
+
+Query:
+      
+      SELECT o.parent_vertical,
+            p.created_at,
+            sum(no_transactions) no_transactions
+
+      from `gc-prd-ext-data-test-prod-906c.gc_paysvc_live.organisations` o 
+      inner join `gc-prd-ext-data-test-prod-906c.gc_paysvc_live.mandates` m
+      on o.id = m.organisation_id
+      left join 
+                (select mandate_id, 
+                        cast(created_at as date) as created_at,
+                        count(id) no_transactions 
+                 from `gc-prd-ext-data-test-prod-906c.gc_paysvc_live.payments` p
+                 where 
+                     amount > 0  and created_at is not null and charge_date is not null --successfully transaction
+                 group by mandate_id,currency,cast(created_at as date)  ) p
+      on p.mandate_id = m.id
+
+      where p.created_at is not null
+
+      group by o.parent_vertical,  p.created_at
+
+
+##### 2. Cummulative number of activations: 
+###### Aim: To compare pre and post campaign 
+
+
+Query:
+
+    select 
+        distinct t1.created_at, 
+        sum(count(t1.mandate_id)) over ( order by t1.created_at asc) as cum_activated_mandates,
+        case when t1.created_at < cast('2016-12-01' as date) 
+        then 0 else 1
+        end as campaign_status  ---0 pre, 1 post
+    from 
+    (
+              select 
+                   min(cast(p.created_at as date)) as created_at,   
+                   mandate_id
+
+              from `gc-prd-ext-data-test-prod-906c.gc_paysvc_live.payments` p
+              inner join  `gc-prd-ext-data-test-prod-906c.gc_paysvc_live.mandates` m
+              on m.id = p.mandate_id
+
+              where p.created_at is not null
+              and p.amount > 0 and p.created_at is not null and p.charge_date is not null --successfully transaction
+              group by mandate_id
+            ) 
+            as t1
+
+    group by t1.created_at
+
+```{r}
+install.packages(c("CausalImpact",
+                   "ggfortify",
+                    "changepoint",
+                    "strucchange",
+                    "ggpmisc",
+                    "ggeasy")
+                )
+```
+
+
+```{r}
+library(CausalImpact)
+library(tidyverse)
+library(xts)
+library(zoo)
+library(lubridate)
+library(SparkR)
+library(tidyr)
+library(dplyr)
+library(ggeasy)
+require(gridExtra)
+```
+
+
+```{r}
+# Cummulative activation rate data set
+act <- read.df("dbfs:/FileStore/shared_uploads/phuong.le@man-es.com/CausualImpact_all.csv",
+                "csv",
+                header=TRUE)
+
+# Daily transaction data set
+daily <- read.df("dbfs:/FileStore/shared_uploads/phuong.le@man-es.com/dailytransaction.csv", 
+                 "csv", 
+                 header=TRUE)
+act <- collect(act)
+daily <- collect(daily)
+```
+
+
+```{r}
+# Explore data
+daily$no_transactions <-as.numeric(daily$no_transactions)
+daily$created_at<-as.Date(daily$created_at)
+str(daily)
+```
+
+
+```{r}
+transaction_plot <- ggplot(data = daily, aes(created_at, 
+                         no_transactions)) +
+                          geom_line(color = "lightblue", size = 0.5) +
+                          geom_point(color = "red", size = 0.05) + 
+                          labs(title = "Number of transactions on daily basis",
+                          y = "Transactions", x = "") + 
+                          facet_grid( parent_vertical ~.,scales="free") 
+transaction_plot 
+```
+
+# 
+
+##### Comments about the plot above:
+
+######High growth in number of transactions pre vs post campaign can be seen in:
+    Health care
+    Sport fitness
+    Tradesmen
+    Digital service
+######Low growth or no growth at all, indicating campaign seems not to influence much in: 
+    Prefessional and financial service
+    Societies and club
+    Property
+    
+######Except sociaties and club, all other verticals have seasonal impact over time.
+######Seasonality can be seen in 
+1. Monthly season
+    Professional and financial services 
+    Sport fitness
+2. Combined monthly and weekly season
+    Property
+    Digital services
+    Tradesmen and non professionals services
+3. Weekly season
+    Healthcare
+
+=> These observations will be used to highlight seasonality in the times series model in later part. 
+
+##### Causal Impact model
+
+This implementation use causal model using Bayesian structural time-series model
+
+Use 2 libraries bsts and CasualImpact to measure the causal effect of the campaign on a time series.
+
+Source:
+
+  https://cran.r-project.org/web/packages/CausalImpact
+
+```{r}
+# Explore cummulative activation rate dataset
+vars <-c("created_at","cum_activated_mandates","campaign_status")
+pre.period <- c(as.Date("2016-04-02"), as.Date("2016-11-30"))
+post.period <- c(as.Date("2016-12-01"),as.Date("2017-03-06"))
+```
+
+
+```{r}
+act$created_at <- as.Date(act$created_at)
+act$cum_activated_mandates <- as.numeric(act$cum_activated_mandates)
+act$campaign_status  <- as.numeric(act$campaign_status)
+str(act)
+```
+
+
+```{r}
+
+cum_activated_mandates<-xts(as.numeric(act$cum_activated_mandates),
+                            as.Date(act$created_at))
+
+campaign_status<-xts(as.numeric(act$campaign_status),
+                     as.Date(act$created_at))
+
+act_ts <- cbind(cum_activated_mandates,campaign_status)
+act_ts <-zoo(act_ts)
+
+head(act_ts)
+```
+
+
+```{r}
+# Fit with month seasonal
+impact4 <- CausalImpact(act_ts, 
+                          pre.period, 
+                          post.period,
+                          model.args = list(niter = 1000,
+                                            nseasons = 365, 
+                                            season.duration =7))
+plot(impact4)
+```
+
+
+```{r}
+summary(impact3)
+```
+
