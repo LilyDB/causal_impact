@@ -1,8 +1,8 @@
 
 ---
 title: "Causal Impact - campaign analysis"
-output:
-  html_document:
+
+output: rmarkdown::github_document
     toc: true
 ---
 
